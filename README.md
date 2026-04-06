@@ -7,9 +7,21 @@
 ## Требования на сервере
 
 - Ubuntu 24.04 (или совместимый Debian/Ubuntu)
-- Docker и **Docker Compose v2** (`docker compose`)
+- Docker и **Docker Compose**: подойдёт **`docker compose`** (плагин v2) или отдельная команда **`docker-compose`**
 - `openssl`, `curl`, `python3`
 - Запуск от **root** (`sudo`)
+
+### Если пишет `docker: 'compose' is not a docker command`
+
+Установите плагин Compose для Docker (рекомендуется):
+
+```bash
+sudo apt-get update
+sudo apt-get install -y docker-compose-plugin
+docker compose version
+```
+
+Либо установите пакет `docker-compose` из репозитория — скрипт `deploy-telemt.sh` подхватит его автоматически.
 
 ## Скачать скрипт на VPS (рекомендуется)
 

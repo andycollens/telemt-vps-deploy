@@ -21,6 +21,9 @@ readonly API_HOST_PORT="19091"
 readonly COMPOSE_PROJECT="telemt_proxy"
 readonly USER_COUNT=10
 
+# Заполняется в detect_docker_compose(): ("docker" "compose") или ("docker-compose")
+COMPOSE_CMD_WORDS=()
+
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || { echo "Ошибка: не найдена команда '$1'." >&2; exit 1; }
 }
@@ -139,8 +142,27 @@ services:
 EOF
 }
 
+# Поддержка Docker Compose v2 (плагин `docker compose`) и бинаря `docker-compose`
+detect_docker_compose() {
+  if docker compose version >/dev/null 2>&1; then
+    COMPOSE_CMD_WORDS=(docker compose)
+    echo "Используется Docker Compose: docker compose (плагин v2)"
+    return 0
+  fi
+  if command -v docker-compose >/dev/null 2>&1 && docker-compose version >/dev/null 2>&1; then
+    COMPOSE_CMD_WORDS=(docker-compose)
+    echo "Используется Docker Compose: docker-compose (отдельный бинарь)"
+    return 0
+  fi
+  echo "Ошибка: не найден Docker Compose." >&2
+  echo "Установите плагин v2 (Ubuntu/Debian):" >&2
+  echo "  apt-get update && apt-get install -y docker-compose-plugin" >&2
+  echo "или пакет docker-compose, затем снова запустите этот скрипт." >&2
+  exit 1
+}
+
 compose() {
-  docker compose -f "${COMPOSE_FILE}" -p "${COMPOSE_PROJECT}" "$@"
+  "${COMPOSE_CMD_WORDS[@]}" -f "${COMPOSE_FILE}" -p "${COMPOSE_PROJECT}" "$@"
 }
 
 wait_for_api() {
@@ -155,7 +177,7 @@ wait_for_api() {
     sleep 1
     ((n++)) || true
   done
-  echo "Таймаут: API не поднялся за 60 с. Смотрите: docker compose logs telemt" >&2
+  echo "Таймаут: API не поднялся за 60 с. Смотрите логи сервиса telemt (compose logs)." >&2
   return 1
 }
 
@@ -241,10 +263,7 @@ main() {
   need_cmd curl
   need_cmd python3
 
-  if ! docker compose version >/dev/null 2>&1; then
-    echo "Нужен Docker Compose v2 (команда: docker compose)." >&2
-    exit 1
-  fi
+  detect_docker_compose
 
   local FAKE_TLS_DOMAIN PUBLIC_IP
   local secrets_tmp
@@ -286,7 +305,7 @@ main() {
   echo "  Compose:    ${COMPOSE_FILE}"
   echo "  TLS cache:  ${TLS_DIR}"
   echo "  Ссылки:     ${LINKS_MD}"
-  echo "  Логи:       docker compose -f ${COMPOSE_FILE} -p ${COMPOSE_PROJECT} logs -f telemt"
+  echo "  Логи:       ${COMPOSE_CMD_WORDS[*]} -f ${COMPOSE_FILE} -p ${COMPOSE_PROJECT} logs -f telemt"
 }
 
 main "$@"
