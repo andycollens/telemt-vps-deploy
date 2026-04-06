@@ -2,6 +2,8 @@
 
 Скрипт для Ubuntu 24.04 с Docker: поднимает [TeleMT](https://github.com/telemt/telemt) (`ghcr.io/telemt/telemt:latest`) на порту **8443**, создаёт **10** пользователей, сохраняет `tg://proxy` ссылки в `/opt/telemt/MTProto_Links.md`, настраивает UFW (если активен).
 
+**Репозиторий:** [github.com/andycollens/telemt-vps-deploy](https://github.com/andycollens/telemt-vps-deploy)
+
 ## Требования на сервере
 
 - Ubuntu 24.04 (или совместимый Debian/Ubuntu)
@@ -9,47 +11,39 @@
 - `openssl`, `curl`, `python3`
 - Запуск от **root** (`sudo`)
 
-## Быстрый старт с GitHub
-
-1. Создайте на GitHub новый репозиторий (можно пустой, без README).
-2. На своей машине (где уже есть этот код) добавьте remote и отправьте ветку:
-
-   ```bash
-   cd /path/to/telemt
-   git init
-   git add deploy-telemt.sh README.md .gitignore
-   git commit -m "Initial commit: TeleMT deploy script"
-   git branch -M main
-   git remote add origin https://github.com/<ВАШ_НИК>/<ИМЯ_РЕПО>.git
-   git push -u origin main
-   ```
-
-3. На **VPS** скачайте скрипт и запустите:
-
-   ```bash
-   curl -fsSL "https://raw.githubusercontent.com/<ВАШ_НИК>/<ИМЯ_РЕПО>/main/deploy-telemt.sh" -o deploy-telemt.sh
-   chmod +x deploy-telemt.sh
-   sudo ./deploy-telemt.sh
-   ```
-
-   Либо через `wget`:
-
-   ```bash
-   wget -qO deploy-telemt.sh "https://raw.githubusercontent.com/<ВАШ_НИК>/<ИМЯ_РЕПО>/main/deploy-telemt.sh"
-   chmod +x deploy-telemt.sh
-   sudo ./deploy-telemt.sh
-   ```
-
-   Замените `<ВАШ_НИК>` и `<ИМЯ_РЕПО>` на ваши значения. Если основная ветка не `main`, замените её в URL.
-
-## Клонирование целиком (альтернатива)
+## Скачать скрипт на VPS (рекомендуется)
 
 ```bash
-git clone https://github.com/<ВАШ_НИК>/<ИМЯ_РЕПО>.git
-cd <ИМЯ_РЕПО>
+curl -fsSL "https://raw.githubusercontent.com/andycollens/telemt-vps-deploy/main/deploy-telemt.sh" -o deploy-telemt.sh
 chmod +x deploy-telemt.sh
 sudo ./deploy-telemt.sh
 ```
+
+Через `wget`:
+
+```bash
+wget -qO deploy-telemt.sh "https://raw.githubusercontent.com/andycollens/telemt-vps-deploy/main/deploy-telemt.sh"
+chmod +x deploy-telemt.sh
+sudo ./deploy-telemt.sh
+```
+
+## Клонирование целиком
+
+```bash
+git clone https://github.com/andycollens/telemt-vps-deploy.git
+cd telemt-vps-deploy
+chmod +x deploy-telemt.sh
+sudo ./deploy-telemt.sh
+```
+
+## Разработка: push из локальной копии
+
+```bash
+git remote add origin https://github.com/andycollens/telemt-vps-deploy.git
+git push -u origin main
+```
+
+(Если `origin` уже есть: `git remote set-url origin https://github.com/andycollens/telemt-vps-deploy.git`.)
 
 ## Что делает скрипт
 
