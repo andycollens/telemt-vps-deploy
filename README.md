@@ -1,6 +1,6 @@
 # TeleMT — развёртывание MTProto (Fake TLS) на VPS
 
-Скрипт для Ubuntu 24.04 с Docker: поднимает [TeleMT](https://github.com/telemt/telemt) (`ghcr.io/telemt/telemt:latest`) на порту **8443**, создаёт **10** пользователей, сохраняет `tg://proxy` ссылки в `/opt/telemt/MTProto_Links.md`, настраивает UFW (если активен).
+Скрипт для Ubuntu 24.04 с Docker: поднимает [TeleMT](https://github.com/telemt/telemt) (`ghcr.io/telemt/telemt:latest`) на порту **8443**, спрашивает **сколько** пользователей создать (1–100) и **имя** каждого (пустой Enter → `user001`, `user002`, …), сохраняет `tg://proxy` ссылки в `/opt/telemt/MTProto_Links.md`, настраивает UFW (если активен).
 
 **Репозиторий:** [github.com/andycollens/telemt-vps-deploy](https://github.com/andycollens/telemt-vps-deploy)
 
@@ -62,6 +62,7 @@ git push -u origin main
 - Создаёт `/opt/telemt/config`, `/opt/telemt/tlsfront`
 - Пересоздаёт `config.toml`, `docker-compose.yml` при повторном запуске (только внутри `/opt/telemt`)
 - Запрашивает домен Fake TLS; **публичный IPv4** пытается взять с сервера (через внешний сервис), с возможностью ввести другой IP или hostname
+- Спрашивает **число пользователей** (1–100) и **имя** каждого; пустой Enter даёт автоматическое имя `user001`, `user002`, …
 - Поднимает контейнер: `docker compose up --detach --force-recreate` (проект `telemt_proxy`, не трогает остальные контейнеры)
 - Открывает порт **8443/tcp** в UFW, если UFW включён
 - Ссылки на прокси берёт из Control API TeleMT и пишет в `MTProto_Links.md`

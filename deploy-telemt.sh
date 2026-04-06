@@ -19,10 +19,14 @@ readonly LINKS_MD="${TELEMT_ROOT}/MTProto_Links.md"
 readonly PROXY_PORT="8443"
 readonly API_HOST_PORT="19091"
 readonly COMPOSE_PROJECT="telemt_proxy"
-readonly USER_COUNT=10
+readonly TELEMT_USER_COUNT_MIN=1
+readonly TELEMT_USER_COUNT_MAX=100
 
 # Заполняется в detect_docker_compose(): ("docker" "compose") или ("docker-compose")
 COMPOSE_CMD_WORDS=()
+
+# Имена пользователей после prompt_user_count_and_names()
+TELEMT_USERNAMES=()
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || { echo "Ошибка: не найдена команда '$1'." >&2; exit 1; }
@@ -86,6 +90,57 @@ prompt_public_ip_or_host() {
   prompt_nonempty "$var_name" "Публичный адрес для клиентов:"
 }
 
+# Сколько пользователей и имена (Enter = user001, user002, … по номеру слота)
+prompt_user_count_and_names() {
+  local n raw name i j duplicate
+  TELEMT_USERNAMES=()
+
+  while true; do
+    read -r -p "Сколько пользователей создать (${TELEMT_USER_COUNT_MIN}–${TELEMT_USER_COUNT_MAX})? " n
+    n="$(echo -n "${n}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    if [[ "${n}" =~ ^[0-9]+$ ]] && (( n >= TELEMT_USER_COUNT_MIN && n <= TELEMT_USER_COUNT_MAX )); then
+      break
+    fi
+    echo "Введите целое число от ${TELEMT_USER_COUNT_MIN} до ${TELEMT_USER_COUNT_MAX}."
+  done
+
+  echo
+  echo "Имена (как в TeleMT: буквы, цифры, _, точка, дефис; длина 1–64). Пустой Enter — авто: user001, user002, …"
+  for ((i=1; i<=n; i++)); do
+    while true; do
+      read -r -p "Пользователь #${i} [Enter = user$(printf '%03d' "${i}")]: " raw
+      raw="$(echo -n "${raw}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+      if [[ -z "${raw}" ]]; then
+        name="$(printf 'user%03d' "${i}")"
+      else
+        name="${raw}"
+      fi
+      if (( ${#name} < 1 || ${#name} > 64 )); then
+        echo "Длина имени должна быть от 1 до 64 символов."
+        continue
+      fi
+      if [[ ! "${name}" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+        echo "Допустимы только символы: A–Z, a–z, 0–9, _, ., -"
+        continue
+      fi
+      duplicate=0
+      for ((j=0; j<${#TELEMT_USERNAMES[@]}; j++)); do
+        if [[ "${TELEMT_USERNAMES[j]}" == "${name}" ]]; then
+          duplicate=1
+          break
+        fi
+      done
+      if (( duplicate )); then
+        echo "Имя «${name}» уже занято — введите другое или оставьте Enter для автогенерации."
+        continue
+      fi
+      TELEMT_USERNAMES+=("${name}")
+      break
+    done
+  done
+  echo
+}
+
 # Пересоздание артефактов при оборванной установке (только наша директория)
 reset_local_artifacts() {
   mkdir -p "${CFG_DIR}" "${TLS_DIR}"
@@ -97,10 +152,16 @@ gen_hex_secret() {
   openssl rand -hex 16
 }
 
-# Вызывающий код передаёт путь к файлу секретов; записывает config.toml и строки "user secret" в этот файл
+# Аргументы: домен, публичный хост, файл секретов, затем список имён пользователей
 write_config_toml() {
   local fake_tls_domain="$1" public_ip="$2" secrets_out="$3"
-  local i name
+  shift 3
+  local name sec
+
+  if [[ $# -lt 1 ]]; then
+    echo "Внутренняя ошибка: список пользователей пуст." >&2
+    exit 1
+  fi
 
   : > "${secrets_out}"
   cat > "${CONFIG_FILE}" <<EOF
@@ -143,12 +204,11 @@ tls_front_dir = "tlsfront"
 [access.users]
 EOF
 
-  for ((i=1; i<=USER_COUNT; i++)); do
-    name="$(printf 'user%02d' "${i}")"
-    local sec
+  for name in "$@"; do
     sec="$(gen_hex_secret)"
     echo "${name} ${sec}" >> "${secrets_out}"
-    printf '%s = "%s"\n' "${name}" "${sec}" >> "${CONFIG_FILE}"
+    # Ключ в кавычках — допустима точка в имени (TeleMT), без конфликта с синтаксисом TOML
+    printf '"%s" = "%s"\n' "${name}" "${sec}" >> "${CONFIG_FILE}"
   done
 }
 
@@ -313,6 +373,7 @@ main() {
   echo "=== TeleMT + Fake TLS (EE), порт ${PROXY_PORT} ==="
   prompt_nonempty FAKE_TLS_DOMAIN "Введите домен для Fake TLS (пример: cdn.example.com):"
   prompt_public_ip_or_host PUBLIC_IP
+  prompt_user_count_and_names
 
   echo
   echo "Создаю/очищаю только ${TELEMT_ROOT} (остальные контейнеры не трогаю)…"
@@ -321,7 +382,7 @@ main() {
   secrets_tmp="$(mktemp)"
   trap 'rm -f "${secrets_tmp}"' EXIT
 
-  write_config_toml "${FAKE_TLS_DOMAIN}" "${PUBLIC_IP}" "${secrets_tmp}"
+  write_config_toml "${FAKE_TLS_DOMAIN}" "${PUBLIC_IP}" "${secrets_tmp}" "${TELEMT_USERNAMES[@]}"
   write_compose
 
   echo
