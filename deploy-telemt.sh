@@ -1,0 +1,292 @@
+#!/usr/bin/env bash
+#===============================================================================
+# TeleMT (Fake TLS / EE) — развёртывание через Docker Compose на Ubuntu 24.04
+# Образ: ghcr.io/telemt/telemt:latest
+#
+# Безопасность для остального Docker:
+#   - Только docker compose -f /opt/telemt/docker-compose.yml -p telemt_proxy …
+#   - Нет docker prune, нет остановки «чужих» контейнеров/volumes
+#   - Публикуется только 8443 (прокси) и 127.0.0.1:19091 (API для снятия ссылок)
+#===============================================================================
+set -euo pipefail
+
+readonly TELEMT_ROOT="/opt/telemt"
+readonly CFG_DIR="${TELEMT_ROOT}/config"
+readonly TLS_DIR="${TELEMT_ROOT}/tlsfront"
+readonly COMPOSE_FILE="${TELEMT_ROOT}/docker-compose.yml"
+readonly CONFIG_FILE="${CFG_DIR}/config.toml"
+readonly LINKS_MD="${TELEMT_ROOT}/MTProto_Links.md"
+readonly PROXY_PORT="8443"
+readonly API_HOST_PORT="19091"
+readonly COMPOSE_PROJECT="telemt_proxy"
+readonly USER_COUNT=10
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || { echo "Ошибка: не найдена команда '$1'." >&2; exit 1; }
+}
+
+require_root() {
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    echo "Запустите скрипт от root (sudo)." >&2
+    exit 1
+  fi
+}
+
+prompt_nonempty() {
+  local var_name="$1" prompt_text="$2" val=""
+  while [[ -z "${val}" ]]; do
+    read -r -p "${prompt_text} " val
+    val="$(echo -n "${val}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  done
+  printf -v "$var_name" '%s' "${val}"
+}
+
+# Пересоздание артефактов при оборванной установке (только наша директория)
+reset_local_artifacts() {
+  mkdir -p "${CFG_DIR}" "${TLS_DIR}"
+  rm -f "${COMPOSE_FILE}" "${CONFIG_FILE}" "${LINKS_MD}"
+  find "${TLS_DIR}" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+}
+
+gen_hex_secret() {
+  openssl rand -hex 16
+}
+
+# Вызывающий код передаёт путь к файлу секретов; записывает config.toml и строки "user secret" в этот файл
+write_config_toml() {
+  local fake_tls_domain="$1" public_ip="$2" secrets_out="$3"
+  local i name
+
+  : > "${secrets_out}"
+  cat > "${CONFIG_FILE}" <<EOF
+### TeleMT — автогенерация (Fake TLS, порт ${PROXY_PORT})
+[general]
+use_middle_proxy = true
+log_level = "normal"
+
+[general.modes]
+classic = false
+secure = false
+tls = true
+
+[general.links]
+show = "*"
+public_host = "${public_ip}"
+public_port = ${PROXY_PORT}
+
+[server]
+port = ${PROXY_PORT}
+
+[server.api]
+enabled = true
+listen = "0.0.0.0:9091"
+# Пустой whitelist = разрешить все источники (см. docs/API.md TeleMT).
+# API наружу не публикуем — только 127.0.0.1:${API_HOST_PORT} на хосте.
+whitelist = []
+minimal_runtime_enabled = false
+minimal_runtime_cache_ttl_ms = 1000
+
+[[server.listeners]]
+ip = "0.0.0.0"
+
+[censorship]
+tls_domain = "${fake_tls_domain}"
+mask = true
+tls_emulation = true
+tls_front_dir = "tlsfront"
+
+[access.users]
+EOF
+
+  for ((i=1; i<=USER_COUNT; i++)); do
+    name="$(printf 'user%02d' "${i}")"
+    local sec
+    sec="$(gen_hex_secret)"
+    echo "${name} ${sec}" >> "${secrets_out}"
+    printf '%s = "%s"\n' "${name}" "${sec}" >> "${CONFIG_FILE}"
+  done
+}
+
+write_compose() {
+  cat > "${COMPOSE_FILE}" <<EOF
+services:
+  telemt:
+    image: ghcr.io/telemt/telemt:latest
+    container_name: telemt_proxy
+    restart: unless-stopped
+    working_dir: /run/telemt
+    ports:
+      - "${PROXY_PORT}:${PROXY_PORT}"
+      - "127.0.0.1:${API_HOST_PORT}:9091"
+    volumes:
+      - ${TELEMT_ROOT}/config/config.toml:/run/telemt/config.toml:ro
+      - ${TELEMT_ROOT}/tlsfront:/run/telemt/tlsfront
+    tmpfs:
+      - /run/telemt:rw,mode=1777,size=16m
+    environment:
+      - RUST_LOG=info
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+EOF
+}
+
+compose() {
+  docker compose -f "${COMPOSE_FILE}" -p "${COMPOSE_PROJECT}" "$@"
+}
+
+wait_for_api() {
+  local url="http://127.0.0.1:${API_HOST_PORT}/v1/health"
+  local n=0
+  echo "Ожидание готовности API (${url})…"
+  while (( n < 60 )); do
+    if curl -fsS "${url}" >/dev/null 2>&1; then
+      echo "API отвечает."
+      return 0
+    fi
+    sleep 1
+    ((n++)) || true
+  done
+  echo "Таймаут: API не поднялся за 60 с. Смотрите: docker compose logs telemt" >&2
+  return 1
+}
+
+fetch_users_json() {
+  curl -fsS "http://127.0.0.1:${API_HOST_PORT}/v1/users"
+}
+
+write_markdown() {
+  local fake_tls_domain="$1" public_ip="$2" users_json="$3" secrets_file="$4"
+  local ts
+  ts="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+
+  python3 - "${LINKS_MD}" "${fake_tls_domain}" "${public_ip}" "${PROXY_PORT}" "${ts}" "${secrets_file}" "${users_json}" <<'PY'
+import json, sys, pathlib
+
+_, out, domain, pub_ip, port, ts, sec_path, users_json = sys.argv[:8]
+users = json.loads(users_json)
+if not users.get("ok"):
+    print("Неожиданный ответ API /v1/users", file=sys.stderr)
+    sys.exit(1)
+rows = users["data"]
+
+secrets = {}
+for line in pathlib.Path(sec_path).read_text(encoding="utf-8").splitlines():
+    parts = line.split(None, 1)
+    if len(parts) == 2:
+        secrets[parts[0]] = parts[1]
+
+lines = []
+lines.append("# MTProto (TeleMT, Fake TLS / EE)")
+lines.append("")
+lines.append(f"- **Сгенерировано:** {ts}")
+lines.append(f"- **Публичный адрес прокси:** `{pub_ip}:{port}`")
+lines.append(f"- **Fake TLS (SNI / tls_domain):** `{domain}`")
+lines.append(f"- **Образ:** `ghcr.io/telemt/telemt:latest`")
+lines.append("")
+lines.append("## Пользователи и ссылки `tg://proxy`")
+lines.append("")
+lines.append(
+    "Ссылки ниже взяты из **Control API** (`GET /v1/users`, поле `links.tls`) — "
+    "рекомендуемый способ; не собирайте EE-ссылки вручную, если не уверены в формате."
+)
+lines.append("")
+
+for u in sorted(rows, key=lambda x: x["username"]):
+    uname = u["username"]
+    sec = secrets.get(uname, "")
+    tls_links = u.get("links", {}).get("tls") or []
+    lines.append(f"### `{uname}`")
+    lines.append("")
+    lines.append(f"- **Секрет (32 hex, из config.toml):** `{sec}`")
+    lines.append("")
+    if not tls_links:
+        lines.append("_API не вернул TLS-ссылок для этого пользователя._")
+        lines.append("")
+        continue
+    for i, link in enumerate(tls_links, 1):
+        lines.append(f"{i}. `{link}`")
+    lines.append("")
+
+pathlib.Path(out).write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+PY
+}
+
+configure_firewall() {
+  echo "Настройка firewall для TCP ${PROXY_PORT}…"
+  if command -v ufw >/dev/null 2>&1; then
+    if ufw status 2>/dev/null | grep -qi 'Status: active'; then
+      ufw allow "${PROXY_PORT}/tcp" comment 'TeleMT MTProto' >/dev/null || true
+      echo "Правило UFW добавлено: ${PROXY_PORT}/tcp"
+    else
+      echo "UFW не активен — правило не добавлялось. При включении UFW выполните: ufw allow ${PROXY_PORT}/tcp"
+    fi
+  else
+    echo "UFW не найден. При использовании nftables/iptables откройте порт ${PROXY_PORT}/tcp вручную."
+  fi
+}
+
+main() {
+  require_root
+  need_cmd docker
+  need_cmd openssl
+  need_cmd curl
+  need_cmd python3
+
+  if ! docker compose version >/dev/null 2>&1; then
+    echo "Нужен Docker Compose v2 (команда: docker compose)." >&2
+    exit 1
+  fi
+
+  local FAKE_TLS_DOMAIN PUBLIC_IP
+  local secrets_tmp
+
+  echo "=== TeleMT + Fake TLS (EE), порт ${PROXY_PORT} ==="
+  prompt_nonempty FAKE_TLS_DOMAIN "Введите домен для Fake TLS (пример: cdn.example.com):"
+  prompt_nonempty PUBLIC_IP     "Введите публичный IPv4 (или hostname) для клиентов:"
+
+  echo
+  echo "Создаю/очищаю только ${TELEMT_ROOT} (остальные контейнеры не трогаю)…"
+  reset_local_artifacts
+
+  secrets_tmp="$(mktemp)"
+  trap 'rm -f "${secrets_tmp}"' EXIT
+
+  write_config_toml "${FAKE_TLS_DOMAIN}" "${PUBLIC_IP}" "${secrets_tmp}"
+  write_compose
+
+  echo
+  echo "Запуск только проекта '${COMPOSE_PROJECT}' (pull + detach)…"
+  compose down --remove-orphans 2>/dev/null || true
+  compose pull
+  compose up --detach --force-recreate
+
+  wait_for_api
+
+  echo "Получаю список пользователей и ссылки из API…"
+  USERS_JSON="$(fetch_users_json)"
+  write_markdown "${FAKE_TLS_DOMAIN}" "${PUBLIC_IP}" "${USERS_JSON}" "${secrets_tmp}"
+
+  rm -f "${secrets_tmp}"
+  trap - EXIT
+
+  configure_firewall
+
+  echo
+  echo "Готово."
+  echo "  Конфиг:     ${CONFIG_FILE}"
+  echo "  Compose:    ${COMPOSE_FILE}"
+  echo "  TLS cache:  ${TLS_DIR}"
+  echo "  Ссылки:     ${LINKS_MD}"
+  echo "  Логи:       docker compose -f ${COMPOSE_FILE} -p ${COMPOSE_PROJECT} logs -f telemt"
+}
+
+main "$@"
