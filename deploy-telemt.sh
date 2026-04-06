@@ -48,6 +48,20 @@ prompt_nonempty() {
   printf -v "$var_name" '%s' "${val}"
 }
 
+# Имя пользователя TeleMT: [A-Za-z0-9_.-], длина 1–64
+validate_telemt_username() {
+  local name="$1"
+  if (( ${#name} < 1 || ${#name} > 64 )); then
+    echo "Длина имени должна быть от 1 до 64 символов."
+    return 1
+  fi
+  if [[ ! "${name}" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+    echo "Допустимы только символы: A–Z, a–z, 0–9, _, ., -"
+    return 1
+  fi
+  return 0
+}
+
 # Публичный IPv4 (исходящий) через внешние сервисы; только IPv4 (-4)
 detect_public_ipv4() {
   local ip="" url
@@ -115,14 +129,7 @@ prompt_user_count_and_names() {
       else
         name="${raw}"
       fi
-      if (( ${#name} < 1 || ${#name} > 64 )); then
-        echo "Длина имени должна быть от 1 до 64 символов."
-        continue
-      fi
-      if [[ ! "${name}" =~ ^[A-Za-z0-9_.-]+$ ]]; then
-        echo "Допустимы только символы: A–Z, a–z, 0–9, _, ., -"
-        continue
-      fi
+      validate_telemt_username "${name}" || continue
       duplicate=0
       for ((j=0; j<${#TELEMT_USERNAMES[@]}; j++)); do
         if [[ "${TELEMT_USERNAMES[j]}" == "${name}" ]]; then
@@ -152,18 +159,101 @@ gen_hex_secret() {
   openssl rand -hex 16
 }
 
-# Аргументы: домен, публичный хост, файл секретов, затем список имён пользователей
-write_config_toml() {
-  local fake_tls_domain="$1" public_ip="$2" secrets_out="$3"
-  shift 3
-  local name sec
+# Из существующего config.toml в файл строк «имя 32hex» (порядок как в файле). Код 0 если есть хотя бы один.
+extract_users_pairs_from_config() {
+  local cfg="$1" out="$2"
+  python3 - "${cfg}" "${out}" <<'PY'
+import re, sys
 
-  if [[ $# -lt 1 ]]; then
-    echo "Внутренняя ошибка: список пользователей пуст." >&2
+cfg, out_path = sys.argv[1], sys.argv[2]
+try:
+    text = open(cfg, encoding="utf-8", errors="replace").read()
+except OSError:
+    sys.exit(2)
+key = "[access.users]"
+idx = text.find(key)
+if idx < 0:
+    sys.exit(1)
+part = text[idx + len(key) :]
+pairs = []
+for line in part.splitlines():
+    s = line.strip().replace("\r", "")
+    if not s or s.startswith("#"):
+        continue
+    if re.match(r"^\[[^\]]+\]\s*$", s):
+        break
+    m = re.match(r'^"([^"]+)"\s*=\s*"([0-9a-fA-F]{32})"\s*$', s)
+    if not m:
+        m = re.match(r"^([A-Za-z0-9_.-]+)\s*=\s*\"([0-9a-fA-F]{32})\"\s*$", s)
+    if m:
+        pairs.append((m.group(1), m.group(2)))
+if not pairs:
+    sys.exit(1)
+with open(out_path, "w", encoding="utf-8") as f:
+    for name, sec in pairs:
+        f.write(f"{name} {sec}\n")
+sys.exit(0)
+PY
+}
+
+# Файл пар «имя секрет» — спросить новое имя для каждой строки (Enter = оставить)
+prompt_rename_existing_users() {
+  local pairs_file="$1"
+  local tmp newname oldname sec raw duplicate j
+  tmp="$(mktemp)"
+  declare -a seen=()
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    [[ -z "${line// }" ]] && continue
+    oldname="${line%% *}"
+    sec="${line#* }"
+    while true; do
+      read -r -p "Пользователь «${oldname}» — новое имя [Enter = оставить]: " raw
+      raw="$(echo -n "${raw}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+      if [[ -z "${raw}" ]]; then
+        newname="${oldname}"
+      else
+        newname="${raw}"
+      fi
+      validate_telemt_username "${newname}" || continue
+      duplicate=0
+      for ((j=0; j<${#seen[@]}; j++)); do
+        if [[ "${seen[j]}" == "${newname}" ]]; then
+          duplicate=1
+          break
+        fi
+      done
+      if (( duplicate )); then
+        echo "Имя «${newname}» уже занято в этом списке."
+        continue
+      fi
+      seen+=("${newname}")
+      echo "${newname} ${sec}" >> "${tmp}"
+      break
+    done
+  done < "${pairs_file}"
+  mv -f "${tmp}" "${pairs_file}"
+}
+
+# TELEMT_USERNAMES[] -> файл пар с новыми случайными секретами
+fill_pairs_random_secrets() {
+  local out="$1"
+  local name
+  : > "${out}"
+  for name in "${TELEMT_USERNAMES[@]}"; do
+    echo "${name} $(gen_hex_secret)" >> "${out}"
+  done
+}
+
+# Домен, публичный хост, файл с строками «имя секрет» (и для MTProto_Links.md)
+write_config_toml_from_pairs() {
+  local fake_tls_domain="$1" public_ip="$2" pairs_file="$3"
+  local line name sec
+
+  if [[ ! -s "${pairs_file}" ]]; then
+    echo "Внутренняя ошибка: нет пользователей (пустой список пар)." >&2
     exit 1
   fi
 
-  : > "${secrets_out}"
   cat > "${CONFIG_FILE}" <<EOF
 ### TeleMT — автогенерация (Fake TLS, порт ${PROXY_PORT})
 [general]
@@ -204,12 +294,13 @@ tls_front_dir = "tlsfront"
 [access.users]
 EOF
 
-  for name in "$@"; do
-    sec="$(gen_hex_secret)"
-    echo "${name} ${sec}" >> "${secrets_out}"
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    [[ -z "${line// }" ]] && continue
+    name="${line%% *}"
+    sec="${line#* }"
     # Ключ в кавычках — допустима точка в имени (TeleMT), без конфликта с синтаксисом TOML
     printf '"%s" = "%s"\n' "${name}" "${sec}" >> "${CONFIG_FILE}"
-  done
+  done < "${pairs_file}"
 }
 
 write_compose() {
@@ -368,21 +459,58 @@ main() {
   detect_docker_compose
 
   local FAKE_TLS_DOMAIN PUBLIC_IP
-  local secrets_tmp
+  local PAIRS_TMP
+  local exist_n um existed_users
 
   echo "=== TeleMT + Fake TLS (EE), порт ${PROXY_PORT} ==="
   prompt_nonempty FAKE_TLS_DOMAIN "Введите домен для Fake TLS (пример: cdn.example.com):"
   prompt_public_ip_or_host PUBLIC_IP
-  prompt_user_count_and_names
+
+  PAIRS_TMP="$(mktemp)"
+  trap 'rm -f "${PAIRS_TMP}"' EXIT
+
+  existed_users=0
+  if [[ -f "${CONFIG_FILE}" ]] && extract_users_pairs_from_config "${CONFIG_FILE}" "${PAIRS_TMP}"; then
+    existed_users=1
+  fi
+
+  if (( existed_users )); then
+    exist_n="$(wc -l < "${PAIRS_TMP}" | tr -d ' ')"
+    echo ""
+    echo "В текущем конфиге уже задано пользователей с ключами (секретами): ${exist_n}"
+    while true; do
+      read -r -p "Дальше: [o] оставить имена и ключи / [p] переименовать (ключи сохранить) / [n] новая установка (новые ключи): " um
+      um="$(echo -n "${um}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+      case "${um}" in
+        o)
+          break
+          ;;
+        p)
+          prompt_rename_existing_users "${PAIRS_TMP}"
+          break
+          ;;
+        n)
+          TELEMT_USERNAMES=()
+          prompt_user_count_and_names
+          fill_pairs_random_secrets "${PAIRS_TMP}"
+          break
+          ;;
+        *)
+          echo "Введите букву: o, p или n."
+          ;;
+      esac
+    done
+  else
+    TELEMT_USERNAMES=()
+    prompt_user_count_and_names
+    fill_pairs_random_secrets "${PAIRS_TMP}"
+  fi
 
   echo
   echo "Создаю/очищаю только ${TELEMT_ROOT} (остальные контейнеры не трогаю)…"
   reset_local_artifacts
 
-  secrets_tmp="$(mktemp)"
-  trap 'rm -f "${secrets_tmp}"' EXIT
-
-  write_config_toml "${FAKE_TLS_DOMAIN}" "${PUBLIC_IP}" "${secrets_tmp}" "${TELEMT_USERNAMES[@]}"
+  write_config_toml_from_pairs "${FAKE_TLS_DOMAIN}" "${PUBLIC_IP}" "${PAIRS_TMP}"
   write_compose
 
   echo
@@ -395,10 +523,7 @@ main() {
 
   echo "Получаю список пользователей и ссылки из API…"
   USERS_JSON="$(fetch_users_json)"
-  write_markdown "${FAKE_TLS_DOMAIN}" "${PUBLIC_IP}" "${USERS_JSON}" "${secrets_tmp}"
-
-  rm -f "${secrets_tmp}"
-  trap - EXIT
+  write_markdown "${FAKE_TLS_DOMAIN}" "${PUBLIC_IP}" "${USERS_JSON}" "${PAIRS_TMP}"
 
   configure_firewall
 
