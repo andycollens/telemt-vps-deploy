@@ -61,7 +61,7 @@ git push -u origin main
 
 - Создаёт `/opt/telemt/config`, `/opt/telemt/tlsfront`
 - Пересоздаёт `config.toml`, `docker-compose.yml` при повторном запуске (только внутри `/opt/telemt`)
-- Запрашивает домен Fake TLS и публичный IP для клиентов
+- Запрашивает домен Fake TLS; **публичный IPv4** пытается взять с сервера (через внешний сервис), с возможностью ввести другой IP или hostname
 - Поднимает контейнер: `docker compose up --detach --force-recreate` (проект `telemt_proxy`, не трогает остальные контейнеры)
 - Открывает порт **8443/tcp** в UFW, если UFW включён
 - Ссылки на прокси берёт из Control API TeleMT и пишет в `MTProto_Links.md`

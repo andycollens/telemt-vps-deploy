@@ -44,6 +44,48 @@ prompt_nonempty() {
   printf -v "$var_name" '%s' "${val}"
 }
 
+# Публичный IPv4 (исходящий) через внешние сервисы; только IPv4 (-4)
+detect_public_ipv4() {
+  local ip="" url
+  for url in \
+    "https://api.ipify.org" \
+    "https://ifconfig.me/ip" \
+    "https://icanhazip.com" \
+    "https://checkip.amazonaws.com"
+  do
+    ip="$(curl -4 -fsS --connect-timeout 4 --max-time 10 "$url" 2>/dev/null | tr -d '[:space:]')"
+    if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+      echo "$ip"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Авто-IP с сервера; при отказе или сбое — ввод IPv4 или hostname
+prompt_public_ip_or_host() {
+  local var_name="$1"
+  local detected ans
+
+  echo "Определение публичного IPv4 (исходящий запрос с сервера)…"
+  if detected="$(detect_public_ipv4)"; then
+    echo "Обнаружен публичный IPv4: ${detected}"
+    read -r -p "Использовать его в ссылках tg://proxy? [Y/n]: " ans
+    ans="$(echo "${ans:-Y}" | tr '[:upper:]' '[:lower:]')"
+    case "${ans}" in
+      ""|y|yes|д|да)
+        printf -v "$var_name" '%s' "${detected}"
+        return 0
+        ;;
+    esac
+    echo "Введите другой публичный IPv4 или hostname для клиентов."
+  else
+    echo "Автоопределение не удалось (сеть, файрвол или сервис недоступен)."
+    echo "Введите публичный IPv4 или hostname вручную."
+  fi
+  prompt_nonempty "$var_name" "Публичный адрес для клиентов:"
+}
+
 # Пересоздание артефактов при оборванной установке (только наша директория)
 reset_local_artifacts() {
   mkdir -p "${CFG_DIR}" "${TLS_DIR}"
@@ -270,7 +312,7 @@ main() {
 
   echo "=== TeleMT + Fake TLS (EE), порт ${PROXY_PORT} ==="
   prompt_nonempty FAKE_TLS_DOMAIN "Введите домен для Fake TLS (пример: cdn.example.com):"
-  prompt_nonempty PUBLIC_IP     "Введите публичный IPv4 (или hostname) для клиентов:"
+  prompt_public_ip_or_host PUBLIC_IP
 
   echo
   echo "Создаю/очищаю только ${TELEMT_ROOT} (остальные контейнеры не трогаю)…"
